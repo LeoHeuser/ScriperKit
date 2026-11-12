@@ -1,6 +1,40 @@
+# macOS
 .DS_Store
+
+# Swift Package Manager
 /.build
+/Packages
 .swiftpm/
+Package.resolved
+
+# Xcode
 xcuserdata/
 DerivedData/
-Package.resolved
+*.xcodeproj/
+*.xcworkspace/
+*.xcuserstate
+*.dSYM
+*.dSYM.zip
+*.ipa
+
+# Secrets and local environment
+.env
+.env.*
+.netrc
+*.p8
+*.p12
+*.pem
+*.mobileprovision
+
+# Claude Code: local settings and the plan of a working session
+.claude/
+tasks/
+
+# Screenshot exports, should one ever be written into the checkout
+*-SS-Export*/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
