@@ -13,7 +13,7 @@ App Store screenshots from the real app in the Simulator, for every device, stor
 
 A scene is one fixed state of the app, such as "editor with keyboard". The runner builds the app once, then launches it once per device, store language, and scene, and tells it which scene to show. The app only has to draw that scene; devices, languages, the status bar, and the export are the runner's job.
 
-Every run covers three devices (iPhone, iPad, iPhone Duo) in every store language the app is localized in.
+Nothing about languages or devices is configured. The runner reads both from the built app: every language Xcode localized it in, named like the store locales in App Store Connect, on every device family it supports (iPhone, iPad, iPhone Duo).
 
 ## Adding it to an app
 
@@ -65,9 +65,11 @@ Where the app decides what to show, ask for the scene and put the app into its s
 
 Three rules keep the images identical from run to run:
 
-- A scene is drawn, never played: no timers, no network, no camera or microphone.
-- Anything that depends on timing or on first launch is switched off in a screenshot launch, such as tips, permission prompts, and a paywall.
+- A scene is drawn, never played: no timers, no network, no camera, microphone, or on-device model. Where the app would show their result, it shows a fixed one.
+- Anything that depends on timing, an account, or an earlier launch is switched off in a screenshot launch, such as onboarding, tips, review and permission prompts, and a paywall.
 - Scene code stays behind `#if DEBUG`, like the library.
+
+Most apps also need demo content: an in-memory store filled on every screenshot launch, with texts from a String Catalog in "Preview Content", so they are translated but never ship. The [integration guide](Documentation/ScriperKit.md#integrating-an-app) covers this, navigation, sheets, fixed service results, and code shared with app extensions.
 
 ### 4. Add the configuration
 
@@ -80,6 +82,9 @@ SCHEME="MyApp"
 
 # Scenes, in the order they are captured. Each name is a case of ScreenshotScene.
 SCENES=(list editor)
+
+# Optional: any value of Scripts/defaults.conf, such as the appearance.
+APPEARANCE="light"
 ```
 
 Exclude the file from the app target, so it does not land in the app bundle.
@@ -99,7 +104,7 @@ Narrow a run while working on one scene:
   --devices iPhone --locales "de-DE,en-US" --scenes editor
 ```
 
-Keep Simulator.app closed during a run. The images land in:
+Keep Simulator.app closed during a run. The images land in one folder per day; a later run of the same day replaces the images it captures again and keeps the rest:
 
 ```
 ~/Downloads/MyApp-SS-Export 2026-01-09/
@@ -119,7 +124,8 @@ The run ends with the number of screenshots and of images to check. It exits wit
 
 - **Simulators:** the runner creates its own, named `ScriperKit <device>`, and shares them between apps. It never touches other simulators or the Mac's settings.
 - **Runtime:** a new simulator gets the newest installed runtime that supports the device. A device that no installed runtime supports is skipped and reported.
-- **Languages:** a language the app is not localized in is never exported.
+- **Languages:** every `.lproj` of the built app runs, so a language added in Xcode is in the next run. "en" fills en-US, en-GB, en-AU, and en-CA; a regional localization such as pt-PT fills only its own store. Region and keyboard come from the simulator runtime.
+- **Devices:** a device family the app does not support, such as iPad for an iPhone-only app, is skipped.
 - **Time:** roughly a minute per device and language.
 
 Details, the list of devices and store languages, and the decisions behind the design are in [Documentation/ScriperKit.md](Documentation/ScriperKit.md).

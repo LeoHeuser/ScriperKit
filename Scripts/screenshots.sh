@@ -7,7 +7,8 @@
 # Usage, from the app's project root:
 #   screenshots.sh --config <app's screenshots.conf>
 #     [--devices "iPhone,iPad"] [--locales "de-DE,en-US"] [--scenes "list,editor"]
-# Each filter narrows the configured list; without filters everything runs.
+# Devices and languages come from the built app: every configured device of a family it supports,
+# in every language it is localized in. Each filter narrows that; without filters everything runs.
 #
 # Safety: the runner only touches its own simulators, named "ScriperKit <device>".
 # Simulator settings are written with plutil to that simulator's own files, or with
@@ -59,14 +60,11 @@ is_selected() {
   [ -z "$filter" ] || [[ ",$filter," == *",$value,"* ]]
 }
 
-# The first free folder name, so an earlier export of the same day is never overwritten.
+# One folder per app and day, so the day's latest images are always in one place: a later run adds
+# its images and replaces those of the same device, language, and scene. Images no later run
+# captured again, such as those of other languages, stay.
 make_export_dir() {
-  local base="$HOME/Downloads/$APP_NAME-SS-Export $(date +%Y-%m-%d)" dir counter=2
-  dir="$base"
-  while [ -e "$dir" ]; do
-    dir="$base ($counter)"
-    counter=$((counter + 1))
-  done
+  local dir="$HOME/Downloads/$APP_NAME-SS-Export $(date +%Y-%m-%d)"
   mkdir -p "$dir"
   echo "$dir"
 }
@@ -80,26 +78,33 @@ build_app() {
   BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw -o - "$APP_PATH/Info.plist")"
   # Names the export folder. The bundle name rather than the display name, which may hold spaces.
   APP_NAME="$(plutil -extract CFBundleName raw -o - "$APP_PATH/Info.plist")"
-  DEVELOPMENT_LANGUAGE="$(plutil -extract CFBundleDevelopmentRegion raw -o - "$APP_PATH/Info.plist")"
 }
 
-# True when the built app is localized in the system language or in its base language, such as
-# "en" for "en-GB". The development language counts even without a folder of its own.
-app_supports() {
-  local language="$1"
-  [ -d "$APP_PATH/$language.lproj" ] || [ -d "$APP_PATH/${language%%-*}.lproj" ] \
-    || [ "${language%%-*}" = "${DEVELOPMENT_LANGUAGE%%-*}" ]
+# Reads languages and device families from the built app and the simulator runtimes. Compiled once
+# and again only when its source changes; the stable Xcode builds it like the app.
+build_simulator_info() {
+  SIMULATOR_INFO="$WORK_DIR/simulator-info"
+  if [ ! -x "$SIMULATOR_INFO" ] || [ "$RUNNER_DIR/simulator-info.swift" -nt "$SIMULATOR_INFO" ]; then
+    mkdir -p "$WORK_DIR"
+    xcrun swiftc -O -o "$SIMULATOR_INFO" "$RUNNER_DIR/simulator-info.swift"
+  fi
 }
 
-# A language the app is not localized in is left out of a run. One asked for by name ends the
-# run before the first screenshot, because its images would show the wrong language.
+# One line per store language of the app on that simulator: folder|language|region|keyboard.
+# With "-" instead of a simulator, the keyboard stays empty.
+app_locales() {
+  "$SIMULATOR_INFO" locales "$APP_PATH" "$1" "${STORE_LOCALES[@]}"
+}
+
+# A language the app is not localized in is never exported. One asked for by name ends the run
+# before the first screenshot, because its images would show the wrong language.
 check_requested_languages() {
-  local entry folder language rest
+  local folders folder
   [ -n "$LOCALE_FILTER" ] || return 0
-  for entry in "${LOCALES[@]}"; do
-    IFS='|' read -r folder language rest <<< "$entry"
-    if is_selected "$folder" "$LOCALE_FILTER" && ! app_supports "$language"; then
-      echo "$APP_NAME is not localized in $folder" >&2
+  folders="$(app_locales - | cut -d '|' -f 1)"
+  for folder in ${LOCALE_FILTER//,/ }; do
+    if ! grep -qxF "$folder" <<< "$folders"; then
+      echo "$APP_NAME is not localized in $folder. Its languages: $(tr '\n' ' ' <<< "$folders")" >&2
       return 64
     fi
   done
@@ -216,25 +221,30 @@ is_blank() {
 }
 
 # Screenshots until one repeats the attempt before it and the screen is not blank, so the export
-# never shows a launch still in progress or a sheet mid-animation. Keeps the last attempt either
-# way and reports one that never settled, so a person checks it.
+# never shows a launch still in progress or a sheet mid-animation. Keeps the last attempt of a
+# screen that never settled and reports it, so a person checks it. Attempts go to the work folder
+# and reach the export only when kept, so a blank screen never replaces an earlier good image.
 capture_settled() {
-  local udid="$1" file="$2" display_option="$3" previous attempt
+  local udid="$1" file="$2" display_option="$3" attempt_file="$WORK_DIR/attempt.png" previous attempt
   previous="$(mktemp)"
   for attempt in $(seq "$CAPTURE_ATTEMPTS"); do
-    xcrun simctl io "$udid" screenshot ${display_option:+"$display_option"} "$file" >/dev/null 2>&1
-    if ! is_blank "$file" && cmp -s "$file" "$previous"; then
+    xcrun simctl io "$udid" screenshot ${display_option:+"$display_option"} "$attempt_file" >/dev/null 2>&1
+    if ! is_blank "$attempt_file" && cmp -s "$attempt_file" "$previous"; then
       rm "$previous"
+      mv "$attempt_file" "$file"
+      CAPTURED=$((CAPTURED + 1))
       return 0
     fi
-    cp "$file" "$previous"
+    cp "$attempt_file" "$previous"
     sleep "$CAPTURE_RETRY_SECONDS"
   done
   rm "$previous"
-  if is_blank "$file"; then
-    rm "$file"
+  if is_blank "$attempt_file"; then
+    rm "$attempt_file"
     echo "Missing $(basename "$file"): the screen stayed blank" >&2
   else
+    mv "$attempt_file" "$file"
+    CAPTURED=$((CAPTURED + 1))
     echo "Check $(basename "$file"): the screen never settled" >&2
   fi
   ISSUES=$((ISSUES + 1))
@@ -261,17 +271,25 @@ capture_scene() {
 
 run_device() {
   local device_name="$1" device_type="$2" displays="$3"
-  local udid entry folder language region keyboard scene
+  local udid locales folder language region keyboard scene support=0
+  # A device family the app does not run on natively, such as iPad for an iPhone-only app, has no
+  # place on its product page. An unknown device type goes on and is reported below.
+  "$SIMULATOR_INFO" supports "$APP_PATH" "$device_type" 2>/dev/null || support=$?
+  if [ "$support" -eq 1 ]; then
+    echo "Skipping $device_name: $APP_NAME does not support this device family"
+    return
+  fi
   # A device no installed runtime supports is skipped, so it never costs the other devices.
   if ! udid="$(find_or_create_simulator "$SIMULATOR_PREFIX $device_name" "$device_type")"; then
     echo "Skipping $device_name: no installed runtime supports $device_type" >&2
     ISSUES=$((ISSUES + 1))
     return
   fi
-  for entry in "${LOCALES[@]}"; do
-    IFS='|' read -r folder language region keyboard <<< "$entry"
+  # Per device, because each simulator's runtime brings its own keyboards. Read from its own file
+  # descriptor, because simctl inside the loop would otherwise consume the list from stdin.
+  locales="$(app_locales "$udid")"
+  while IFS='|' read -r folder language region keyboard <&3; do
     is_selected "$folder" "$LOCALE_FILTER" || continue
-    app_supports "$language" || continue
     echo "$device_name $folder"
     shutdown_simulator "$udid"
     set_simulator_language "$udid" "$language" "$region" "$keyboard"
@@ -285,14 +303,16 @@ run_device() {
       sleep "$SCENE_SETTLE_SECONDS"
       capture_scene "$udid" "$displays" "$EXPORT_DIR/$device_name/$folder" "$scene"
     done
-  done
+  done 3<<< "$locales"
   shutdown_simulator "$udid"
 }
 
 main() {
-  local entry device_name device_type displays count
+  local entry device_name device_type displays
   ISSUES=0
+  CAPTURED=0
   build_app
+  build_simulator_info
   check_requested_languages
   EXPORT_DIR="$(make_export_dir)"
   echo "Exporting to $EXPORT_DIR"
@@ -303,10 +323,10 @@ main() {
     is_selected "$device_name" "$DEVICE_FILTER" || continue
     run_device "$device_name" "$device_type" "$displays"
   done
-  count="$(find "$EXPORT_DIR" -name '*.png' | wc -l | tr -d ' ')"
-  echo "$count screenshots in $EXPORT_DIR, $ISSUES to check"
+  # Counts this run only: the folder may also hold images of an earlier run of the same day.
+  echo "$CAPTURED screenshots to $EXPORT_DIR, $ISSUES to check"
   # A filter value that matches nothing in the configuration, such as a typo, ends up here.
-  if [ "$count" -eq 0 ]; then
+  if [ "$CAPTURED" -eq 0 ]; then
     echo "Nothing captured: check --devices, --locales, and --scenes against the configuration" >&2
     return 64
   fi
