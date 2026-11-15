@@ -5,7 +5,9 @@
 # See Documentation/ScriperKit.md.
 #
 # Usage, from the app's project root:
-#   screenshots.sh --config <app's screenshots.conf>
+#   screenshots.sh --init
+#     Writes a starting screenshots.conf and ScreenshotScene.swift for the app.
+#   screenshots.sh [--config <path>, default ./screenshots.conf]
 #     [--devices "iPhone,iPad"] [--locales "de-DE,en-US"] [--scenes "list,editor"]
 # Devices and languages come from the built app: every configured device of a family it supports,
 # in every language it is localized in. Each filter narrows that; without filters everything runs.
@@ -29,12 +31,14 @@ SCENE_ARGUMENT="-ScreenshotScene"
 LAUNCH_ATTEMPTS=15
 LAUNCH_RETRY_SECONDS=2
 
-CONFIG=""
+CONFIG="screenshots.conf"
+INIT=false
 DEVICE_FILTER=""
 LOCALE_FILTER=""
 SCENE_FILTER=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --init) INIT=true; shift ;;
     --config) CONFIG="$2"; shift 2 ;;
     --devices) DEVICE_FILTER="$2"; shift 2 ;;
     --locales) LOCALE_FILTER="$2"; shift 2 ;;
@@ -43,11 +47,95 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Writes a starting configuration into the project root and a scene file into the app's source
+# folder, named like the project as Xcode creates it. Never overwrites a file.
+init_app() {
+  local workspace name list scheme scene_file
+  if [ -e screenshots.conf ]; then
+    echo "screenshots.conf exists already in $(pwd)" >&2
+    return 64
+  fi
+  workspace="$(find . -maxdepth 2 -name '*.xcworkspace' -not -path '*.xcodeproj/*' | sort | head -1)"
+  if [ -z "$workspace" ]; then
+    workspace="$(find . -maxdepth 1 -name '*.xcodeproj' | sort | head -1)"
+    if [ -z "$workspace" ]; then
+      echo "No Xcode workspace or project in $(pwd): run --init from the app's project root" >&2
+      return 64
+    fi
+    # Every project carries a workspace of its own, so the runner always builds a workspace.
+    workspace="$workspace/project.xcworkspace"
+  fi
+  workspace="${workspace#./}"
+  name="$(basename "${workspace%/project.xcworkspace}")"
+  name="${name%.*}"
+  # The scheme named like the project, otherwise the first one; a workspace also lists the
+  # schemes of its packages.
+  list="$(mktemp)"
+  xcodebuild -list -json -workspace "$workspace" > "$list" 2>/dev/null
+  if grep -qF "\"$name\"" <(plutil -extract workspace.schemes json -o - "$list"); then
+    scheme="$name"
+  else
+    scheme="$(plutil -extract workspace.schemes.0 raw -o - "$list")"
+  fi
+  rm "$list"
+
+  scene_file="ScreenshotScene.swift"
+  [ -d "$name" ] && scene_file="$name/ScreenshotScene.swift"
+  if [ -e "$scene_file" ]; then
+    echo "$scene_file exists already" >&2
+    return 64
+  fi
+
+  cat > screenshots.conf <<CONF
+# Configuration of ScriperKit's screenshot runner for this app. Devices and languages come from the
+# built app. Any value of ScriperKit's Scripts/defaults.conf can be overridden here.
+
+# Relative to the project root, where the runner is started.
+WORKSPACE="$workspace"
+SCHEME="$scheme"
+
+# Scenes, in the order they are captured. Each name is a case of ScreenshotScene.
+SCENES=(home)
+CONF
+
+  cat > "$scene_file" <<'SWIFT'
+// DEBUG only, like ScriperKit itself, so none of it reaches the App Store build.
+#if DEBUG
+import ScriperKit
+
+/// A fixed, finished app state for one App Store screenshot, chosen per launch by ScriperKit's
+/// runner. Each case is a scene name in screenshots.conf, captured in that order.
+///
+/// Where the app decides what to show, check the scene and put the app into its state:
+/// `if ScreenshotScene.current == .home { … }`, or `ScreenshotScene.isActive` for anything all
+/// scenes share, such as hiding tips. Keep every such check behind `#if DEBUG` too.
+enum ScreenshotScene: String, LaunchScene {
+    case home
+
+    /// The scene of this launch, or `nil` for a normal launch.
+    static let current = launchScene()
+}
+#endif
+SWIFT
+
+  echo "Wrote screenshots.conf (workspace $workspace, scheme $scheme) and $scene_file."
+  echo "Next: link the ScriperKit library to the app target, then draw the scenes."
+}
+
+if $INIT; then
+  init_app
+  exit
+fi
+
 # The defaults first, so the app's configuration overrides them and adds what only the app knows.
 # shellcheck source=defaults.conf
 source "$RUNNER_DIR/defaults.conf"
+if [ ! -f "$CONFIG" ]; then
+  echo "No $CONFIG in $(pwd): run from the app's project root, create one with --init, or pass --config" >&2
+  exit 64
+fi
 # shellcheck disable=SC1090
-source "${CONFIG:?Pass the configuration of the app with --config}"
+source "$CONFIG"
 : "${WORKSPACE:?The configuration must set WORKSPACE}"
 : "${SCHEME:?The configuration must set SCHEME}"
 : "${SCENES:?The configuration must set SCENES}"
@@ -78,6 +166,21 @@ build_app() {
   BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw -o - "$APP_PATH/Info.plist")"
   # Names the export folder. The bundle name rather than the display name, which may hold spaces.
   APP_NAME="$(plutil -extract CFBundleName raw -o - "$APP_PATH/Info.plist")"
+}
+
+# Scene code must vanish from a Release build, and a reference outside #if DEBUG fails only there.
+# Checked before the first screenshot, so it never first shows up in the App Store build.
+check_release_build() {
+  local log="$WORK_DIR/release-build.log"
+  echo "Checking the Release build…"
+  if ! xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
+    -destination "generic/platform=iOS Simulator" -derivedDataPath "$WORK_DIR/DerivedData" \
+    -quiet build > "$log" 2>&1; then
+    # Xcode adds a line per failed compiler call that says nothing about the cause.
+    grep -E "error:" "$log" | grep -v "the following command failed" | head -20 >&2 || true
+    echo "The Release build fails. Is screenshot code outside #if DEBUG? Full log: $log" >&2
+    return 65
+  fi
 }
 
 # Reads languages and device families from the built app and the simulator runtimes. Compiled once
@@ -192,10 +295,13 @@ prepare_booted_simulator() {
   xcrun simctl install "$udid" "$APP_PATH"
 }
 
+# Launches the scene and keeps the app's process ID in LAUNCHED_PID. Simulator apps run as Mac
+# processes, so the runner can check later whether the app is still alive.
 launch_scene() {
-  local udid="$1" scene="$2" attempt
+  local udid="$1" scene="$2" attempt output
   for attempt in $(seq "$LAUNCH_ATTEMPTS"); do
-    if xcrun simctl launch --terminate-running-process "$udid" "$BUNDLE_ID" "$SCENE_ARGUMENT" "$scene" >/dev/null 2>&1; then
+    if output="$(xcrun simctl launch --terminate-running-process "$udid" "$BUNDLE_ID" "$SCENE_ARGUMENT" "$scene" 2>/dev/null)"; then
+      LAUNCHED_PID="${output##* }"
       return 0
     fi
     sleep "$LAUNCH_RETRY_SECONDS"
@@ -301,6 +407,13 @@ run_device() {
       # One scene that fails to launch is reported, not allowed to end a long run.
       launch_scene "$udid" "$scene" || { ISSUES=$((ISSUES + 1)); continue; }
       sleep "$SCENE_SETTLE_SECONDS"
+      # A stopped app would leave the home screen in the image. ScriperKit stops it on a scene
+      # name the app does not know; any crash at launch ends the same way.
+      if ! kill -0 "$LAUNCHED_PID" 2>/dev/null; then
+        echo "Missing $scene: the app stopped after launch. Is \"$scene\" a case of the scene enum?" >&2
+        ISSUES=$((ISSUES + 1))
+        continue
+      fi
       capture_scene "$udid" "$displays" "$EXPORT_DIR/$device_name/$folder" "$scene"
     done
   done 3<<< "$locales"
@@ -312,6 +425,7 @@ main() {
   ISSUES=0
   CAPTURED=0
   build_app
+  check_release_build
   build_simulator_info
   check_requested_languages
   EXPORT_DIR="$(make_export_dir)"

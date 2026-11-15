@@ -14,7 +14,7 @@ Screenshots come from the real app, look identical across languages and runs, an
 | Runner | `Scripts/screenshots.sh` | Builds once, drives its own simulators, captures, exports |
 | Simulator info | `Scripts/simulator-info.swift` | Reads languages and device families from the built app, keyboards from the runtime |
 | Defaults | `Scripts/defaults.conf` | Devices, store locale names, status bar, timing: the same for every app |
-| App configuration | `screenshots.conf` in the app | Workspace, scheme, scenes, and any default the app overrides |
+| App configuration | `screenshots.conf` in the app's project root | Workspace, scheme, scenes, and any default the app overrides |
 
 The app knows nothing about devices, languages, or the export. The runner knows nothing about what a scene shows. Nothing about an app's languages or devices is configured: both come from the built app.
 
@@ -23,13 +23,18 @@ The app knows nothing about devices, languages, or the export. The runner knows 
 From the app's project root:
 
 ```sh
-../ScriperKit/Scripts/screenshots.sh --config <path>/screenshots.conf
-../ScriperKit/Scripts/screenshots.sh --config <path>/screenshots.conf --devices iPhone --locales "de-DE,en-US" --scenes editor
+../ScriperKit/Scripts/screenshots.sh --init
+../ScriperKit/Scripts/screenshots.sh
+../ScriperKit/Scripts/screenshots.sh --devices iPhone --locales "de-DE,en-US" --scenes editor
 ```
+
+`--init` writes a starting `screenshots.conf` into the project root and `ScreenshotScene.swift` into the app's source folder, the folder named like the project. It finds the workspace, or the project's own workspace, and picks the scheme named like the project. It never overwrites a file. A run reads `./screenshots.conf`; `--config` points to one elsewhere.
 
 Without filters, every supported device, store language, and scene runs, one device after the other. Expect roughly a minute per device and language: the restart and fresh install take half of it, the scenes the other half. Narrow the run while a scene is being built, then run everything once.
 
-The run ends with the number of screenshots and of images to check, and exits with an error when any image needs a look. Counted as an image to check: a screen that never settled or stayed blank, a scene that failed to launch, and a device that no installed runtime supports, which is skipped. A filter that matches nothing ends the run with an error, and so does `--locales` with a language the app is not localized in; that error lists the app's store languages.
+Before the first screenshot, the runner builds the app for Release as well and stops if that fails: a reference to scene code outside `#if DEBUG` fails only there, and would otherwise first show up in the App Store build.
+
+The run ends with the number of screenshots and of images to check, and exits with an error when any image needs a look. Counted as an image to check: a screen that never settled or stayed blank, a scene that failed to launch, an app that stopped after launch, and a device that no installed runtime supports, which is skipped. The app stops on a scene name it does not know, so a typo in `SCENES` is reported instead of exporting the normal launch screen. A filter that matches nothing ends the run with an error, and so does `--locales` with a language the app is not localized in; that error lists the app's store languages.
 
 Simulator.app should stay closed during a run: an attached Simulator window can connect the Mac keyboard and hide the software keyboard.
 
@@ -53,6 +58,7 @@ Simulator.app should stay closed during a run: an attached Simulator window can 
 - A device whose family the app does not support natively is skipped: the runner reads `UIDeviceFamily` from the built app, so an iPhone-only app gets no iPad images. An app without the key runs on every device.
 - No runtime is configured. A new simulator gets the newest installed runtime that supports its device type, so the next lower one is used when the newest does not. An existing simulator keeps its runtime for as long as that runtime is installed, so images stay the same from run to run; when it is removed, the runner creates a new simulator.
 - A device that no installed runtime supports is skipped and counted as an image to check.
+- Each boot and shutdown, once per language, can make system processes inside the simulator crash, such as PosterBoard, or exceed their shutdown time. These are faults of the simulator runtime, not of the app or the runner, and never reach a screenshot: the runner waits for a settled screen. macOS shows some of them as crash dialogs on the Mac.
 - iPhone Duo boots folded and cannot be unfolded from the command line, so only its outer screen is configured. Its inner screen is one configuration entry away once unfolding is possible; a display that stays blank is never exported.
 
 ## Store languages
@@ -86,7 +92,8 @@ The steps in the README set the package up. What follows is what scenes need in 
 
 - **Drawn, never played.** A scene shows a fixed state: no timers, network, camera, microphone, biometrics, or on-device model run. Where the app shows the result of such work, it shows a fixed result instead.
 - **The same in every language and run.** Anything that depends on the device, an account, timing, or an earlier launch is set to a fixed value in a screenshot launch.
-- **DEBUG only.** All scene code sits behind `#if DEBUG`, like the library. Check a Release build after integrating: it must build without any of it.
+- **DEBUG only.** All scene code sits behind `#if DEBUG`, like the library. The runner checks that the Release build still succeeds.
+- **One check for all scenes.** Where something applies to every scene, such as hiding tips, ask `ScreenshotScene.isActive`; ask `ScreenshotScene.current` only where scenes differ.
 - **A real user's view.** A scene shows what a set-up user sees: permissions granted, onboarding done, paid features available, an account signed in. The app code that decides these states stays as it is; the scene only answers its questions.
 
 ### Demo content
@@ -122,15 +129,10 @@ The steps in the README set the package up. What follows is what scenes need in 
 
 An app extension that compiles some of the app's files does not link ScriperKit and has no scene type. Keep scene checks out of those files: give them a neutral DEBUG method, such as one that opens an in-memory store, and make the scene decision in an app-only file or view.
 
-### Configuration file in the app target
-
-Exclude `screenshots.conf` from the app target so it does not land in the bundle. With Xcode's synchronized folders, that is a membership exception for the file in the target's exceptions.
-
 ### Checking the result
 
-1. Build Debug and Release.
-2. Run one device in two languages with very different text lengths and formats, such as German and Japanese, and look at every image.
-3. Run everything.
+1. Run one device in two languages with very different text lengths and formats, such as German and Japanese, and look at every image.
+2. Run everything.
 
 ## Safety
 
@@ -149,5 +151,8 @@ Exclude `screenshots.conf` from the app target so it does not land in the bundle
 - Devices one after the other over in parallel: parallel simulators slowed each other down so much that a run took no less time, and late frames reached the export.
 - One export folder per day, updated by every run, over a new folder per run: a narrowed run to fix one scene lands next to the rest, so the day's complete set is always in one folder.
 - A fresh app install per language over erasing the simulator: same clean app state, one boot per language instead of two.
+- The configuration in the project root over one inside the app's folders: outside every target, it needs no exclusion, and the runner finds it without a path.
+- A Release build before every run over a note in the documentation: the one integration mistake that breaks the App Store build is caught where it happens.
+- An unknown scene name stops the app over a normal launch: a silent fallback exported the wrong screen with no warning.
 - A shell script run from the package checkout over a package plugin: Xcode cannot run a command plugin for an app project from the command line.
 - Simulators shared by all apps over one set per app: the app is installed fresh anyway, and each further set costs several gigabytes.
