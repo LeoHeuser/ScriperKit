@@ -2,6 +2,8 @@
 #
 # Captures App Store screenshots from the real app in the Simulator, for every configured device,
 # store language, and scene, into ~/Downloads/<app>-SS-Export <date>/<device>/<language>/.
+# For an app that keeps renders of its devices, each screenshot is also set into its render with
+# its headline, as a finished store image in <export>/App Store/<device>/<language>/.
 # See Documentation/ScriperKit.md.
 #
 # Usage, from the app's project root:
@@ -191,6 +193,90 @@ build_simulator_info() {
     mkdir -p "$WORK_DIR"
     xcrun swiftc -O -o "$SIMULATOR_INFO" "$RUNNER_DIR/simulator-info.swift"
   fi
+}
+
+# Store images are made only for an app that keeps renders, so every other app runs as it always
+# has. A setup that cannot work as a whole, a headline font that is not there, is reported once
+# and switches the step off instead of failing on every image.
+check_store_images() {
+  STORE_IMAGES=false
+  COMPOSED=0
+  [ -d "$RENDERS_DIR" ] || return 0
+  if [ -n "$HEADLINE_FONT" ] && [ ! -f "$HEADLINE_FONT" ]; then
+    echo "No store images: the headline font $HEADLINE_FONT does not exist. Check HEADLINE_FONT in $CONFIG" >&2
+    ISSUES=$((ISSUES + 1))
+    return 0
+  fi
+  STORE_IMAGE="$WORK_DIR/store-image"
+  if [ ! -x "$STORE_IMAGE" ] || [ "$RUNNER_DIR/store-image.swift" -nt "$STORE_IMAGE" ]; then
+    mkdir -p "$WORK_DIR"
+    xcrun swiftc -O -o "$STORE_IMAGE" "$RUNNER_DIR/store-image.swift"
+  fi
+  STORE_IMAGES=true
+}
+
+# The headlines of a store language: its own file, or that of another region of the same
+# language, so one en-US.json also serves en-GB, en-AU, and en-CA.
+headline_file() {
+  local folder="$1" candidate
+  for candidate in "$HEADLINES_DIR/$folder.json" "$HEADLINES_DIR/${folder%%-*}.json" "$HEADLINES_DIR/${folder%%-*}"-*.json; do
+    if [ -f "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Sets each screenshot of a device and language into its render, with its headline. A device
+# without a renders folder is not set up for store images and is left alone. Inside a folder that
+# exists, everything that keeps an image from being made is reported and counted: a store set
+# with a missing image must not pass unnoticed.
+compose_store_images() {
+  local device_name="$1" folder="$2"
+  local renders="$RENDERS_DIR/$device_name" output="$EXPORT_DIR/$STORE_FOLDER/$device_name/$folder"
+  local scene screenshot render headlines headline number=0 name
+  $STORE_IMAGES && [ -d "$renders" ] || return 0
+  # Without a headlines folder the app wants images without text. With one, a language or scene
+  # that has no headline is a gap in the setup.
+  headlines=""
+  if [ -d "$HEADLINES_DIR" ] && ! headlines="$(headline_file "$folder")"; then
+    echo "No store images for $folder: no headlines file for it in $HEADLINES_DIR" >&2
+    ISSUES=$((ISSUES + 1))
+    return 0
+  fi
+  mkdir -p "$output"
+  for scene in "${SCENES[@]}"; do
+    # Numbered in the order of SCENES, because the store shows a set in the order of its file
+    # names. Counted before the filter, so a narrowed run keeps every image's number.
+    number=$((number + 1))
+    # JPEG, the format the store is used to: smaller to upload, and it cannot carry the alpha
+    # channel App Store Connect rejects.
+    name="$(printf '%02d' "$number")-$scene.jpg"
+    is_selected "$scene" "$SCENE_FILTER" || continue
+    screenshot="$EXPORT_DIR/$device_name/$folder/$scene.png"
+    # A screenshot that was not captured is reported where that happened.
+    [ -f "$screenshot" ] || continue
+    render="$renders/$scene.png"
+    if [ ! -f "$render" ]; then
+      echo "No store image for $scene: $render is missing" >&2
+      ISSUES=$((ISSUES + 1))
+      continue
+    fi
+    headline=""
+    if [ -n "$headlines" ] && ! headline="$(plutil -extract "$scene" raw -o - "$headlines" 2>/dev/null)"; then
+      echo "No store image for $scene in $folder: no headline \"$scene\" in $headlines" >&2
+      ISSUES=$((ISSUES + 1))
+      continue
+    fi
+    # The tool says what is wrong with a render it cannot use.
+    if "$STORE_IMAGE" "$render" "$screenshot" "$output/$name" --headline "$headline" \
+      --font "$HEADLINE_FONT" --weight "$HEADLINE_WEIGHT" --color "$HEADLINE_COLOR"; then
+      COMPOSED=$((COMPOSED + 1))
+    else
+      ISSUES=$((ISSUES + 1))
+    fi
+  done
 }
 
 # One line per store language of the app on that simulator: folder|language|region|keyboard.
@@ -416,6 +502,7 @@ run_device() {
       fi
       capture_scene "$udid" "$displays" "$EXPORT_DIR/$device_name/$folder" "$scene"
     done
+    compose_store_images "$device_name" "$folder"
   done 3<<< "$locales"
   shutdown_simulator "$udid"
 }
@@ -428,6 +515,7 @@ main() {
   check_release_build
   build_simulator_info
   check_requested_languages
+  check_store_images
   EXPORT_DIR="$(make_export_dir)"
   echo "Exporting to $EXPORT_DIR"
   # One device after the other: simulators booting in parallel slow each other down so much
@@ -438,7 +526,11 @@ main() {
     run_device "$device_name" "$device_type" "$displays"
   done
   # Counts this run only: the folder may also hold images of an earlier run of the same day.
-  echo "$CAPTURED screenshots to $EXPORT_DIR, $ISSUES to check"
+  if $STORE_IMAGES; then
+    echo "$CAPTURED screenshots and $COMPOSED store images to $EXPORT_DIR, $ISSUES to check"
+  else
+    echo "$CAPTURED screenshots to $EXPORT_DIR, $ISSUES to check"
+  fi
   # A filter value that matches nothing in the configuration, such as a typo, ends up here.
   if [ "$CAPTURED" -eq 0 ]; then
     echo "Nothing captured: check --devices, --locales, and --scenes against the configuration" >&2

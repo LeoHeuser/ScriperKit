@@ -105,6 +105,18 @@ Keep Simulator.app closed during a run. The images land in one folder per day; a
 
 The run ends with the number of screenshots and of images to check. It exits with an error when an image needs a look.
 
+### Finished store images
+
+An app that keeps renders of its devices gets more than screenshots: each one is set into its render, a 3D scene exported from Spline with the device's screen in a key color, together with a headline in that language. The result in `App Store/` of the export folder is ready to upload: JPEGs, numbered in the order of the scenes.
+
+```
+MyApp/
+  Screenshots/Renders/iPhone/editor.png     exported once from Spline
+  metadata/screenshots/en-US.json           { "editor": "Write anywhere." }
+```
+
+Nothing changes for an app without the renders folder. How the scene has to be built in Spline and what happens when a part is missing is in [Store images](Documentation/ScriperKit.md#store-images).
+
 ### Mistakes it catches
 
 - **Scene code outside `#if DEBUG`:** before the first screenshot, the runner builds Release too and stops if that fails, so the mistake never reaches the App Store build.
